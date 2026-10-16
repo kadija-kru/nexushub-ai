@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 BASE=Path(__file__).resolve().parent
 DB=Path(os.getenv('NEXUS_DB',str(BASE/'nexushub.sqlite3')))
-app=FastAPI(title='NexusHub AI API',version='0.1.0')
+app=FastAPI(title='NexusHub AI API',version='0.3.0')
 
 @contextmanager
 def db():
@@ -250,29 +250,95 @@ def publish(site_id:int,u=Depends(current)):
         c.execute("UPDATE sites SET status='published' WHERE id=?",(site_id,))
     return {'ok':True}
 
+async def llm_edit_site(prompt, department, existing_pages, theme):
+    """Permission-filtered input and validated document output; no arbitrary generated code."""
+    key=os.getenv('OPENAI_API_KEY')
+    if not key:return None
+    import httpx
+    instruction=("You edit an existing departmental intranet site. Return only JSON with keys pages and theme. "
+        "Preserve all existing pages, blocks, ids and text unless the employee explicitly asks to change them. "
+        "Use only component types hero,text,cards,announcements,directory,documents,calendar,presentations,links,faq,presentation_embed. "
+        "Each page has id,title,blocks; each block has id,type,title,text. Preserve presentation_id for embeds. "
+        "No invented employee identities, policy documents, or announcements. No arbitrary HTML or scripts. "
+        "Maximum 25 pages and at most 60 blocks per page. First page home must exist. "
+        "Do not perform deletion unless the request expressly and unambiguously asks for it. "
+        "Return the entire updated site, with theme as a six-digit hex color.")
+    try:
+        async with httpx.AsyncClient(timeout=40) as client:
+            r=await client.post('https://api.openai.com/v1/chat/completions',
+                headers={'Authorization':'Bearer '+key},json={
+                'model':os.getenv('NEXUS_AI_MODEL','gpt-4.1-mini'),
+                'messages':[{'role':'system','content':instruction},{'role':'user','content':json.dumps({'department':department,'current_pages':existing_pages,'theme':theme,'requested_change':prompt})}],
+                'response_format':{'type':'json_object'}})
+            r.raise_for_status()
+            result=json.loads(r.json()['choices'][0]['message']['content'])
+            validate_pages(result['pages'])
+            if not result['pages'] or result['pages'][0]['id']!='home':return None
+            if any(len(p['blocks'])>60 for p in result['pages']):return None
+            if not isinstance(result.get('theme'),str) or not re.fullmatch(r'#[0-9a-fA-F]{6}',result['theme']):return None
+            return result['pages'],result['theme']
+    except Exception:return None
+
+@app.get('/api/sites/{site_id}/history')
+def site_history(site_id:int,u=Depends(current)):
+    with db() as c:
+        s=c.execute('SELECT department_id FROM sites WHERE id=?',(site_id,)).fetchone()
+        if not s:raise HTTPException(404,'Site not found')
+        department_access(c,u['id'],s['department_id'])
+        history=[dict(row) for row in c.execute('SELECT id,created_at,user_id FROM site_revisions WHERE site_id=? ORDER BY id DESC LIMIT 30',(site_id,))]
+    return history
+
+@app.post('/api/sites/{site_id}/restore/{revision_id}')
+def restore_site(site_id:int,revision_id:int,u=Depends(current)):
+    with db() as c:
+        s=c.execute('SELECT * FROM sites WHERE id=?',(site_id,)).fetchone()
+        if not s:raise HTTPException(404,'Site not found')
+        department_access(c,u['id'],s['department_id'],edit=True)
+        previous=c.execute('SELECT * FROM site_revisions WHERE id=? AND site_id=?',(revision_id,site_id)).fetchone()
+        if not previous:raise HTTPException(404,'Version not found')
+        c.execute('INSERT INTO site_revisions(site_id,user_id,pages,theme,created_at) VALUES(?,?,?,?,?)',(site_id,u['id'],s['pages'],s['theme'],int(time.time())))
+        c.execute("UPDATE sites SET pages=?,theme=?,version=version+1,status='draft' WHERE id=?",(previous['pages'],previous['theme'],site_id))
+    return {'ok':True}
+
 @app.post('/api/sites/{site_id}/ask')
 async def site_ask(site_id:int,data:Change,u=Depends(current)):
     with db() as c:
         s=c.execute('SELECT * FROM sites WHERE id=?',(site_id,)).fetchone()
         if not s:raise HTTPException(404,'Site not found')
         department_access(c,u['id'],s['department_id'],edit=True)
-    # Transparent limited local editor; no hidden or untrusted generated code execution.
-    pages=json.loads(s['pages']);p=data.prompt.lower();theme=s['theme'];changes=[]
-    colors={'purple':'#7c3aed','blue':'#2563eb','green':'#0d9488','red':'#dc2626','pink':'#db2777','orange':'#ea580c'}
-    for color,hexval in colors.items():
-        if color in p:theme=hexval;changes.append('Changed theme to '+color);break
-    m=re.search(r'(?:add|create|new)\s+(?:a\s+|an\s+)?(?:new\s+)?([a-z ]{2,35}?)\s+page',p)
-    if m:
-        title=m.group(1).strip().title();slug=re.sub('[^a-z0-9]+','-',title.lower())
-        if not any(x['id']==slug for x in pages):
-            pages.append({'id':slug,'title':title,'blocks':[{'id':secrets.token_hex(4),'type':'text','title':title,'text':'Edit this page to add your content.'}]});changes.append('Created '+title+' page')
-    if not changes:return {'changed':False,'message':'I can currently change site colors and add pages. You can also manually edit every page. More natural-language edits require a future implementation.'}
+        department=c.execute('SELECT name FROM departments WHERE id=?',(s['department_id'],)).fetchone()['name']
+    pages=json.loads(s['pages']);p=data.prompt.lower();theme=s['theme'];changes=[];mode='local'
+    generated=await llm_edit_site(data.prompt,department,pages,theme)
+    if generated:
+        pages,theme=generated;mode='AI';changes.append('Nexus AI updated the site. Review your changes before publishing.')
+    else:
+        colors={'purple':'#7c3aed','blue':'#2563eb','green':'#0d9488','red':'#dc2626','pink':'#db2777','orange':'#ea580c','teal':'#0d9488'}
+        for color,hexval in colors.items():
+            if color in p and theme!=hexval:theme=hexval;changes.append('Changed theme to '+color);break
+        m=re.search(r'(?:add|create|new)\s+(?:a\s+|an\s+)?(?:new\s+)?([a-z ]{2,35}?)\s+page',p)
+        if m:
+            title=m.group(1).strip().title();slug=re.sub('[^a-z0-9]+','-',title.lower()).strip('-')
+            if not any(x['id']==slug for x in pages):
+                pages.append({'id':slug,'title':title,'blocks':[{'id':secrets.token_hex(4),'type':'text','title':title,'text':'Edit this page to add your content.'}]});changes.append('Created '+title+' page')
+        # Move a named section to the start of its page, without losing content.
+        move=re.search(r'move (?:the )?([a-z ]+?) (?:section |block )?to (?:the )?top',p)
+        if move:
+            term=move.group(1).strip()
+            for pg in pages:
+                for i,block in enumerate(pg['blocks']):
+                    if term in (block.get('title','')+' '+block.get('type','')).lower() and i>0:
+                        pg['blocks'].insert(0,pg['blocks'].pop(i));changes.append('Moved '+block.get('title','section')+' to the top');break
+    if not changes:return {'changed':False,'mode':'local','message':'No local change matched. Set OPENAI_API_KEY for full conversational site editing; local editing supports colors, new pages, and moving sections.'}
+    validate_pages(pages)
     with db() as c:
         department_access(c,u['id'],s['department_id'],edit=True)
+        # Optimistic version check prevents overwriting another employee's latest update.
+        current_version=c.execute('SELECT version FROM sites WHERE id=?',(site_id,)).fetchone()['version']
+        if current_version!=s['version']:raise HTTPException(409,'The site was updated by someone else. Reload and try again.')
         c.execute('INSERT INTO site_revisions(site_id,user_id,pages,theme,created_at) VALUES(?,?,?,?,?)',(site_id,u['id'],s['pages'],s['theme'],int(time.time())))
         c.execute("UPDATE sites SET pages=?,theme=?,version=version+1,status='draft' WHERE id=?",(json.dumps(pages),theme,site_id))
-        c.execute('INSERT INTO ai_logs(org_id,user_id,department_id,prompt,action,created_at) VALUES(?,?,?,?,?,?)',(s['org_id'],u['id'],s['department_id'],data.prompt,'local_site_edit',int(time.time())))
-    return {'changed':True,'message':'; '.join(changes)}
+        c.execute('INSERT INTO ai_logs(org_id,user_id,department_id,prompt,action,created_at) VALUES(?,?,?,?,?,?)',(s['org_id'],u['id'],s['department_id'],data.prompt,'edit_ai' if generated else 'edit_local',int(time.time())))
+    return {'changed':True,'mode':mode,'message':'; '.join(changes)}
 
 @app.get('/api/departments/{department_id}/presentations')
 def list_presentations(department_id:int,u=Depends(current)):

@@ -52,3 +52,22 @@ def test_cross_department_and_org_restrictions():
     assert call('POST','/sites/generate',admin,{'department_id':dep,'prompt':'Create finance presentations and documents'}).status_code==200
     first_company_user=call('POST','/login',body={'email':'owner@test.invalid','password':'secure-password-123'}).json()['token']
     assert call('GET',f'/departments/{dep}/presentations',first_company_user).status_code==403
+
+def test_site_history_restore_and_permissions():
+    creator=register('History Owner','history@test.invalid')
+    stranger=register('History Stranger','history-stranger@test.invalid')
+    oid=call('POST','/orgs',creator,{'name':'History Company'}).json()['id']
+    did=call('POST',f'/orgs/{oid}/departments',creator,{'name':'Operations'}).json()['id']
+    sid=call('POST','/sites/generate',creator,{'department_id':did,'prompt':'Create a blue operations site with announcements'}).json()['id']
+    before=call('GET',f'/sites/{sid}',creator).json()
+    changed=call('POST',f'/sites/{sid}/ask',creator,{'prompt':'change theme to purple and create a new recruitment page'})
+    assert changed.status_code==200,changed.text
+    assert changed.json()['changed']
+    assert call('GET',f'/sites/{sid}/history',stranger).status_code==403
+    history=call('GET',f'/sites/{sid}/history',creator).json()
+    assert len(history)==1
+    assert call('POST',f'/sites/{sid}/restore/{history[0]["id"]}',stranger).status_code==403
+    assert call('POST',f'/sites/{sid}/restore/{history[0]["id"]}',creator).status_code==200
+    after=call('GET',f'/sites/{sid}',creator).json()
+    assert after['pages']==before['pages'] and after['theme']==before['theme']
+    assert after['status']=='draft'
